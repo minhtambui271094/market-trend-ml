@@ -5,3 +5,5 @@ xgboost
 joblib
 pandas-ta
 matplotlib
+requests
+schedule

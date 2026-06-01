@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 
 
+
 BASE_URL = "https://api.binance.com/api/v3/klines"
 
 
@@ -125,3 +126,14 @@ for name, tf in intervals.items():
     save_data(df, f"data/raw/BTCUSDT_{name}.csv")
 
 print("\nDONE ALL DATA")
+
+import os # <-- Thêm import này ở đầu file
+
+# ... giữ nguyên các hàm trên ...
+
+def save_data(df, filename):
+    # ✅ SỬA: Tự động tạo cây thư mục nếu chưa có sẵn
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    
+    df.to_csv(filename, index=False)
+    print(f"Saved: {filename} ({len(df)} rows)")

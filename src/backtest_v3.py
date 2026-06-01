@@ -1,216 +1,208 @@
-import pandas as pd
+import os
 import numpy as np
-import joblib
+import pandas as pd
+import matplotlib.pyplot as plt
+from trading_engine import TradingEngine
 
-
-class BacktestV3:
-    def __init__(
-        self,
-        model_path="models/trend_model.pkl",
-        fee=0.0004,
-        threshold=0.6,
-        price_col="close_4h",
-        atr_col="atr_4h",
-        vol_col="volatility_4h"
-    ):
-        self.model = joblib.load(model_path)
+class AdvancedBacktesterV3:
+    def __init__(self, initial_balance=10000, fee=0.0005, sl_mult=2.0, tp_mult=3.0):
+        """
+        Bộ máy Backtest chuyên nghiệp tích hợp quản lý vốn AI
+        :param initial_balance: Số dư ban đầu (USD)
+        :param fee: Phí giao dịch mỗi đầu lệnh (0.0005 = 0.05%)
+        :param sl_mult: Hệ số nhân ATR để đặt Stop Loss
+        :param tp_mult: Hệ số nhân ATR để đặt Take Profit
+        """
+        self.initial_balance = initial_balance
         self.fee = fee
-        self.threshold = threshold
-        self.price_col = price_col
-        self.atr_col = atr_col
-        self.vol_col = vol_col
+        self.sl_mult = sl_mult
+        self.tp_mult = tp_mult
 
-    # ======================
-    # FEATURES
-    # ======================
-    def prepare_features(self, df):
-        drop_cols = ["time", "target"]
-        X = df.drop(columns=[c for c in drop_cols if c in df.columns])
-        return X.replace([np.inf, -np.inf], np.nan).fillna(0)
+    def run(self, dataset_path="data/mtf_dataset.csv"):
+        if not os.path.exists(dataset_path):
+            print(f"❌ Không tìm thấy tập dữ liệu tại: {dataset_path}. Vui lòng kiểm tra lại!")
+            return None, []
 
-    # ======================
-    # SIGNAL
-    # ======================
-    def generate_signal(self, proba):
-        p_down, p_side, p_up = proba
+        print("... Đang đọc dữ liệu và khởi chạy Trading Engine để quét tín hiệu")
+        df = pd.read_csv(dataset_path)
+        
+        # Gọi công cụ TradingEngine để lấy tín hiệu từ mô hình AI
+        engine = TradingEngine()
+        df_signals = engine.run(df)
 
-        if p_up > self.threshold and p_up > p_down:
-            return 1
-        elif p_down > self.threshold and p_down > p_up:
-            return -1
-        return 0
+        balance = self.initial_balance
+        position = None       # Trạng thái vị thế: None, 'LONG', 'SHORT'
+        entry_price = 0.0
+        sl_price = 0.0
+        tp_price = 0.0
+        trade_units = 0.0     # Khối lượng hợp đồng/coin nắm giữ
+        allocated_capital = 0.0
+        
+        trades_history = []
+        balance_curve = []
 
-    # ======================
-    # POSITION SIZING
-    # ======================
-    def position_size(self, confidence, atr):
-        """
-        risk-based sizing:
-        - higher confidence → bigger size
-        - higher volatility (ATR) → smaller size
-        """
-        base = confidence
+        print(f"... Đang tiến hành mô phỏng giao dịch chi tiết trên {len(df_signals)} nến 4H")
 
-        vol_penalty = 1 / (1 + atr)
+        for i in range(len(df_signals)):
+            row = df_signals.iloc[i]
+            current_close = row['close_4h']
+            high_price = row['high_4h']
+            low_price = row['low_4h']
+            atr = row['atr_4h']
+            signal = row['signal']
+            pos_size_factor = row['position_size']
+            timestamp = row['time']
 
-        size = base * vol_penalty
+            # --- 1. KIỂM TRA ĐIỀU KIỆN THOÁT LỆNH (ĐÃ CÓ VỊ THẾ) ---
+            if position == 'LONG':
+                # Kiểm tra dính Stop Loss trước (Ưu tiên quản trị rủi ro)
+                if low_price <= sl_price:
+                    exit_price = sl_price
+                    pnl = (exit_price - entry_price) * trade_units
+                    fee_paid = (entry_price + exit_price) * trade_units * self.fee
+                    balance += (pnl - fee_paid)
+                    trades_history.append({
+                        'type': 'LONG', 'result': 'SL', 'entry_time': entry_time, 'exit_time': timestamp,
+                        'entry': entry_price, 'exit': exit_price, 'pnl': pnl - fee_paid, 'balance': balance
+                    })
+                    position = None
+                # Kiểm tra dính Take Profit
+                elif high_price >= tp_price:
+                    exit_price = tp_price
+                    pnl = (exit_price - entry_price) * trade_units
+                    fee_paid = (entry_price + exit_price) * trade_units * self.fee
+                    balance += (pnl - fee_paid)
+                    trades_history.append({
+                        'type': 'LONG', 'result': 'TP', 'entry_time': entry_time, 'exit_time': timestamp,
+                        'entry': entry_price, 'exit': exit_price, 'pnl': pnl - fee_paid, 'balance': balance
+                    })
+                    position = None
+                # Thoát sớm nếu AI đảo chiều báo hiệu Short ngược lại
+                elif signal == -1:
+                    exit_price = current_close
+                    pnl = (exit_price - entry_price) * trade_units
+                    fee_paid = (entry_price + exit_price) * trade_units * self.fee
+                    balance += (pnl - fee_paid)
+                    trades_history.append({
+                        'type': 'LONG', 'result': 'EARLY_EXIT', 'entry_time': entry_time, 'exit_time': timestamp,
+                        'entry': entry_price, 'exit': exit_price, 'pnl': pnl - fee_paid, 'balance': balance
+                    })
+                    position = None
 
-        return np.clip(size, 0, 1)
+            elif position == 'SHORT':
+                # Kiểm tra dính Stop Loss
+                if high_price >= sl_price:
+                    exit_price = sl_price
+                    pnl = (entry_price - exit_price) * trade_units
+                    fee_paid = (entry_price + exit_price) * trade_units * self.fee
+                    balance += (pnl - fee_paid)
+                    trades_history.append({
+                        'type': 'SHORT', 'result': 'SL', 'entry_time': entry_time, 'exit_time': timestamp,
+                        'entry': entry_price, 'exit': exit_price, 'pnl': pnl - fee_paid, 'balance': balance
+                    })
+                    position = None
+                # Kiểm tra dính Take Profit
+                elif low_price <= tp_price:
+                    exit_price = tp_price
+                    pnl = (entry_price - exit_price) * trade_units
+                    fee_paid = (entry_price + exit_price) * trade_units * self.fee
+                    balance += (pnl - fee_paid)
+                    trades_history.append({
+                        'type': 'SHORT', 'result': 'TP', 'entry_time': entry_time, 'exit_time': timestamp,
+                        'entry': entry_price, 'exit': exit_price, 'pnl': pnl - fee_paid, 'balance': balance
+                    })
+                    position = None
+                # Thoát sớm nếu AI đảo chiều báo hiệu Long ngược lại
+                elif signal == 1:
+                    exit_price = current_close
+                    pnl = (entry_price - exit_price) * trade_units
+                    fee_paid = (entry_price + exit_price) * trade_units * self.fee
+                    balance += (pnl - fee_paid)
+                    trades_history.append({
+                        'type': 'SHORT', 'result': 'EARLY_EXIT', 'entry_time': entry_time, 'exit_time': timestamp,
+                        'entry': entry_price, 'exit': exit_price, 'pnl': pnl - fee_paid, 'balance': balance
+                    })
+                    position = None
 
-    # ======================
-    # REGIME FILTER
-    # ======================
-    def regime_filter(self, df):
-        """
-        only trade when volatility is not too low
-        """
-        if self.vol_col not in df.columns:
-            return np.ones(len(df), dtype=bool)
+            # --- 2. KIỂM TRA ĐIỀU KIỆN VÀO LỆNH (KHI ĐANG ĐỨNG NGOÀI) ---
+            if position is None and signal != 0 and pos_size_factor > 0:
+                entry_price = current_close
+                entry_time = timestamp
+                
+                # Quản lý vốn: Kích thước lệnh phụ thuộc vào độ tự tin của AI
+                allocated_capital = balance * pos_size_factor
+                trade_units = allocated_capital / entry_price
 
-        vol = df[self.vol_col].fillna(0)
+                if signal == 1:
+                    position = 'LONG'
+                    sl_price = entry_price - (self.sl_mult * atr if atr > 0 else entry_price * 0.02)
+                    tp_price = entry_price + (self.tp_mult * atr if atr > 0 else entry_price * 0.04)
+                elif signal == -1:
+                    position = 'SHORT'
+                    sl_price = entry_price + (self.sl_mult * atr if atr > 0 else entry_price * 0.02)
+                    tp_price = entry_price - (self.tp_mult * atr if atr > 0 else entry_price * 0.04)
 
-        # dynamic threshold (median)
-        threshold = vol.rolling(50).median().fillna(vol.median())
+            balance_curve.append(balance)
 
-        return vol > threshold
+        df_signals['backtest_balance'] = balance_curve
+        self._print_metrics_summary(trades_history, balance)
+        self._plot_equity_curve(df_signals)
 
-    # ======================
-    # ATR STOP LOSS
-    # ======================
-    def apply_stoploss(self, df):
-        stop = []
+        return df_signals, trades_history
 
-        position = 0
-        entry_price = 0
-        atr = df[self.atr_col].fillna(0)
+    def _print_metrics_summary(self, trades, final_balance):
+        """Tính toán các chỉ số thống kê hiệu suất chuẩn quỹ đầu tư"""
+        print("\n" + "="*45)
+        print("📊 BÁO CÁO KẾT QUẢ KIỂM TRA QUÁ KHỨ (BACKTEST V3)")
+        print("="*45)
+        
+        total_trades = len(trades)
+        print(f"💰 Vốn ban đầu      : {self.initial_balance:,.2f} USDT")
+        print(f"💵 Vốn cuối cùng     : {final_balance:,.2f} USDT")
+        
+        total_return_pct = ((final_balance - self.initial_balance) / self.initial_balance) * 100
+        print(f"📈 Tổng lợi nhuận (%): {total_return_pct:.2f}%")
+        print(f"🏁 Tổng số lệnh đã đi: {total_trades} lệnh")
 
-        for i in range(len(df)):
-            price = df[self.price_col].iloc[i]
-            signal = df["signal"].iloc[i]
+        if total_trades > 0:
+            df_tr = pd.DataFrame(trades)
+            winning_trades = df_tr[df_tr['pnl'] > 0]
+            losing_trades = df_tr[df_tr['pnl'] <= 0]
+            
+            win_rate = (len(winning_trades) / total_trades) * 100
+            print(f"🎯 Tỷ lệ thắng (Win): {win_rate:.2f}%")
+            
+            gross_profit = winning_trades['pnl'].sum()
+            gross_loss = abs(losing_trades['pnl'].sum())
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
+            print(f"⚖️ Profit Factor     : {profit_factor:.2f}")
+            print(f"🟢 Lệnh thắng lớn nhất: {winning_trades['pnl'].max():+,.2f} USDT")
+            print(f"🔴 Lệnh lỗ nặng nhất : {losing_trades['pnl'].min():+,.2f} USDT")
+        else:
+            print("📭 Không có lệnh nào được thực hiện trong suốt giai đoạn này.")
+        print("="*45 + "\n")
 
-            # new entry
-            if signal != 0 and position == 0:
-                position = signal
-                entry_price = price
-                stop.append(0)
-                continue
-
-            # exit logic
-            if position != 0:
-                stop_dist = 1.5 * atr.iloc[i]
-
-                if position == 1:
-                    if price < entry_price - stop_dist:
-                        position = 0
-                        stop.append(-1)
-                        continue
-
-                if position == -1:
-                    if price > entry_price + stop_dist:
-                        position = 0
-                        stop.append(-1)
-                        continue
-
-            stop.append(position)
-
-        df["position"] = stop
-        return df
-
-    # ======================
-    # BACKTEST RUN
-    # ======================
-    def run(self, df):
-        df = df.copy()
-
-        if self.price_col not in df.columns:
-            raise ValueError(f"Missing {self.price_col}")
-
-        X = self.prepare_features(df)
-        probas = self.model.predict_proba(X)
-
-        # signal
-        signals = []
-        for p in probas:
-            signals.append(self.generate_signal(p))
-
-        df["signal"] = signals
-
-        # regime filter
-        regime_ok = self.regime_filter(df)
-        df["signal"] = df["signal"] * regime_ok.astype(int)
-
-        # ATR required fallback
-        if self.atr_col not in df.columns:
-            df[self.atr_col] = df[self.price_col].rolling(14).std()
-
-        # apply stoploss engine
-        df = self.apply_stoploss(df)
-
-        # returns
-        df["ret"] = df[self.price_col].pct_change().shift(-1)
-
-        # confidence approx
-        df["confidence"] = np.max(probas, axis=1)
-
-        # position sizing
-        df["size"] = df.apply(
-            lambda r: self.position_size(r["confidence"], r[self.atr_col]),
-            axis=1
-        )
-
-        # strategy return
-        df["strategy_ret"] = df["position"] * df["size"] * df["ret"]
-
-        # fee
-        df["trade"] = df["position"].diff().abs().fillna(0)
-        df["fee_cost"] = df["trade"] * self.fee
-
-        df["strategy_ret_net"] = df["strategy_ret"] - df["fee_cost"]
-
-        # equity
-        df["equity"] = (1 + df["strategy_ret_net"].fillna(0)).cumprod()
-
-        return df
-
-    # ======================
-    # METRICS
-    # ======================
-    def metrics(self, df):
-        total_return = df["equity"].iloc[-1] - 1
-
-        sharpe = (
-            df["strategy_ret_net"].mean()
-            / (df["strategy_ret_net"].std() + 1e-9)
-        ) * np.sqrt(365)
-
-        max_dd = (df["equity"] / df["equity"].cummax() - 1).min()
-
-        winrate = (df["strategy_ret_net"] > 0).mean()
-
-        trades = df["trade"].sum()
-
-        return {
-            "total_return": float(total_return),
-            "sharpe": float(sharpe),
-            "max_drawdown": float(max_dd),
-            "winrate": float(winrate),
-            "num_trades": float(trades)
-        }
-
+    def _plot_equity_curve(self, df):
+        """Vẽ biểu đồ tăng trưởng tài sản (Equity Curve)"""
+        try:
+            plt.figure(figsize=(12, 6))
+            plt.plot(pd.to_datetime(df['time']), df['backtest_balance'], label='Tài sản Bot AI', color='#1f77b4', linewidth=2)
+            plt.axhline(y=self.initial_balance, color='gray', linestyle='--', label='Vốn gốc ban đầu')
+            plt.title('BIỂU ĐỒ TĂNG TRƯỞNG TÀI SẢN CHI TIẾT (EQUITY CURVE) - BOT V3', fontsize=14, fontweight='bold')
+            plt.xlabel('Thời gian', fontsize=12)
+            plt.ylabel('Số dư tài khoản (USDT)', fontsize=12)
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            
+            # Tạo thư mục reports nếu chưa có để lưu kết quả
+            os.makedirs("reports", exist_ok=True)
+            plt.savefig("reports/equity_curve_v3.png", dpi=300)
+            print("💾 Đã lưu biểu đồ tăng trưởng tài sản vào thư mục: reports/equity_curve_v3.png")
+            plt.close()
+        except Exception as e:
+            print(f"⚠️ Không thể xuất biểu đồ do thiếu thư viện hiển thị đồ họa: {e}")
 
 if __name__ == "__main__":
-    df = pd.read_csv("data/mtf_dataset.csv")
-
-    engine = BacktestV3(
-        threshold=0.6,
-        fee=0.0004
-    )
-
-    result = engine.run(df)
-
-    print("\n========= METRICS V3 =========\n")
-    for k, v in engine.metrics(result).items():
-        print(f"{k}: {v}")
-
-    result.to_csv("data/backtest_v3.csv", index=False)
-    print("\nSaved: data/backtest_v3.csv")
+    # Chạy kiểm thử bộ máy Backtest offline
+    backtester = AdvancedBacktesterV3(initial_balance=10000, fee=0.0005, sl_mult=2.0, tp_mult=3.0)
+    backtester.run(dataset_path="data/mtf_dataset.csv")
